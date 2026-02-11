@@ -95,6 +95,10 @@
         return a;
       };
 
+      function deltaS(nextS, prevS, totalLength) {
+        return ((nextS - prevS + totalLength * 0.5) % totalLength) - totalLength * 0.5;
+      }
+
       const track = {
         centerLine: [],
         segments: [],
@@ -248,7 +252,7 @@
           this.brain = brain;
           this.alive = true;
           this.score = 0;
-          this.lastS = 0;
+          this.lastS = nearestTrackInfo(this.x, this.y).s;
           this.checkpointIndex = 0;
           this.stuckTimer = 0;
           this.slowTimer = 0;
@@ -282,7 +286,8 @@
           this.y += Math.sin(this.angle) * this.speed * dt;
 
           const current = nearestTrackInfo(this.x, this.y);
-          const delta = ((current.s - this.lastS + track.totalLength * 0.5) % track.totalLength) - track.totalLength * 0.5;
+          const prevS = this.lastS;
+          const delta = deltaS(current.s, prevS, track.totalLength);
 
           if (delta > 0.02) {
             this.score += delta * 0.04; // базовая награда за движение вперед
@@ -291,14 +296,23 @@
             this.stuckTimer += dt;
           }
 
-          this.lastS = current.s;
+          if (delta < -0.015) {
+            this.score += delta * 0.08; // штраф за езду назад
+          }
 
-          const nextCheckpointS = track.checkpoints[this.checkpointIndex];
-          const toCheckpoint = ((current.s - nextCheckpointS + track.totalLength) % track.totalLength);
-          if (toCheckpoint < track.totalLength / TRACK_CHECKPOINTS) {
+          const checkpointStep = track.totalLength / TRACK_CHECKPOINTS;
+          let safety = 0;
+          while (safety < TRACK_CHECKPOINTS) {
+            const nextCheckpointS = track.checkpoints[this.checkpointIndex];
+            const toCheckpoint = deltaS(nextCheckpointS, prevS, track.totalLength);
+            const traveledToCheckpoint = toCheckpoint >= 0 && toCheckpoint <= Math.max(0, delta + checkpointStep * 0.25);
+            if (!traveledToCheckpoint) break;
             this.score += 10; // награда за правильное прохождение секции
             this.checkpointIndex = (this.checkpointIndex + 1) % TRACK_CHECKPOINTS;
+            safety += 1;
           }
+
+          this.lastS = current.s;
 
           if (current.distance > TRACK_RADIUS) {
             this.alive = false;
