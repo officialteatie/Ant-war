@@ -1,0 +1,433 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI Racing Evolution</title>
+    <style>
+      :root { color-scheme: dark; }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+        background: #0f1118;
+        color: #ecf0ff;
+        display: grid;
+        min-height: 100vh;
+        place-items: center;
+      }
+      .shell { display: grid; gap: 12px; justify-items: center; }
+      .hud {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px 18px;
+        align-items: center;
+        justify-content: center;
+        font-size: 14px;
+        opacity: 0.95;
+      }
+      .pill {
+        background: #171b28;
+        border: 1px solid #2b3550;
+        border-radius: 999px;
+        padding: 5px 12px;
+      }
+      canvas {
+        width: min(1200px, 96vw);
+        height: auto;
+        border-radius: 12px;
+        border: 1px solid #2c3552;
+        box-shadow: 0 20px 80px rgba(0, 0, 0, 0.42);
+        background: #1d2436;
+      }
+      .hint { opacity: 0.75; font-size: 13px; text-align: center; }
+    </style>
+  </head>
+  <body>
+    <main class="shell">
+      <div class="hud">
+        <span class="pill" id="generation"></span>
+        <span class="pill" id="alive"></span>
+        <span class="pill" id="bestScore"></span>
+        <span class="pill" id="fps"></span>
+      </div>
+      <canvas id="race" width="1200" height="700"></canvas>
+      <div class="hint">100 ИИ машин. Трасса меняется каждый заезд. Награда за прохождение 100 секций в правильном направлении.</div>
+    </main>
+
+    <script>
+      const canvas = document.getElementById('race');
+      const ctx = canvas.getContext('2d');
+
+      const hud = {
+        generation: document.getElementById('generation'),
+        alive: document.getElementById('alive'),
+        bestScore: document.getElementById('bestScore'),
+        fps: document.getElementById('fps'),
+      };
+
+      const POPULATION = 100;
+      const TRACK_RADIUS = 62;
+      const TRACK_CHECKPOINTS = 100;
+      const MAX_STEPS = 2500;
+      const MUTATION_STRENGTH = 0.33;
+      const CAR_LENGTH = 12;
+      const CAR_WIDTH = 7;
+      const SLOW_SPEED_LIMIT = 24;
+      const SLOW_TIMEOUT = 10;
+
+      const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
+      const wrapAngle = (a) => {
+        while (a > Math.PI) a -= Math.PI * 2;
+        while (a < -Math.PI) a += Math.PI * 2;
+        return a;
+      };
+
+      const track = {
+        centerLine: [],
+        segments: [],
+        totalLength: 0,
+        checkpoints: [],
+      };
+
+      function generateTrack(seed = Math.random() * 10_000) {
+        const points = [];
+        const count = 13;
+        const cx = canvas.width * 0.5;
+        const cy = canvas.height * 0.5;
+        const baseR = 230;
+
+        for (let i = 0; i < count; i++) {
+          const t = i / count;
+          const angle = t * Math.PI * 2;
+          const wobbleA = Math.sin(seed * 0.013 + i * 1.91) * 88;
+          const wobbleB = Math.cos(seed * 0.021 + i * 1.47) * 42;
+          const radius = baseR + wobbleA + wobbleB;
+          const x = cx + Math.cos(angle) * radius;
+          const y = cy + Math.sin(angle) * radius * 0.78;
+          points.push({ x: clamp(x, 110, canvas.width - 110), y: clamp(y, 110, canvas.height - 110) });
+        }
+
+        const smoothed = [];
+        for (let i = 0; i < points.length; i++) {
+          const prev = points[(i - 1 + points.length) % points.length];
+          const cur = points[i];
+          const next = points[(i + 1) % points.length];
+          smoothed.push({
+            x: (prev.x * 0.2) + (cur.x * 0.6) + (next.x * 0.2),
+            y: (prev.y * 0.2) + (cur.y * 0.6) + (next.y * 0.2),
+          });
+        }
+
+        track.centerLine = smoothed;
+        track.segments = [];
+        track.totalLength = 0;
+
+        for (let i = 0; i < smoothed.length; i++) {
+          const a = smoothed[i];
+          const b = smoothed[(i + 1) % smoothed.length];
+          const dx = b.x - a.x;
+          const dy = b.y - a.y;
+          const len = Math.hypot(dx, dy);
+          track.segments.push({ a, b, dx, dy, len, startS: track.totalLength });
+          track.totalLength += len;
+        }
+
+        track.checkpoints = [];
+        const spacing = track.totalLength / TRACK_CHECKPOINTS;
+        for (let i = 0; i < TRACK_CHECKPOINTS; i++) {
+          track.checkpoints.push(i * spacing);
+        }
+      }
+
+      function pointAtS(s) {
+        s = ((s % track.totalLength) + track.totalLength) % track.totalLength;
+        for (const seg of track.segments) {
+          if (s <= seg.startS + seg.len) {
+            const t = (s - seg.startS) / seg.len;
+            return {
+              x: seg.a.x + seg.dx * t,
+              y: seg.a.y + seg.dy * t,
+              heading: Math.atan2(seg.dy, seg.dx),
+            };
+          }
+        }
+        const seg = track.segments[track.segments.length - 1];
+        return { x: seg.b.x, y: seg.b.y, heading: Math.atan2(seg.dy, seg.dx) };
+      }
+
+      function nearestTrackInfo(x, y) {
+        let best = { distance: Infinity, s: 0, tangent: 0 };
+
+        for (const seg of track.segments) {
+          const px = x - seg.a.x;
+          const py = y - seg.a.y;
+          const t = clamp((px * seg.dx + py * seg.dy) / (seg.len * seg.len), 0, 1);
+          const cx = seg.a.x + seg.dx * t;
+          const cy = seg.a.y + seg.dy * t;
+          const dist = Math.hypot(x - cx, y - cy);
+
+          if (dist < best.distance) {
+            best = {
+              distance: dist,
+              s: seg.startS + seg.len * t,
+              tangent: Math.atan2(seg.dy, seg.dx),
+            };
+          }
+        }
+
+        return best;
+      }
+
+      function sampleTrackDistance(x, y, angle, maxDist = 150, step = 4) {
+        for (let d = 0; d <= maxDist; d += step) {
+          const sx = x + Math.cos(angle) * d;
+          const sy = y + Math.sin(angle) * d;
+          if (nearestTrackInfo(sx, sy).distance > TRACK_RADIUS) {
+            return d / maxDist;
+          }
+        }
+        return 1;
+      }
+
+      function randomBrain() {
+        return Array.from({ length: 24 }, () => (Math.random() * 2 - 1) * 0.8);
+      }
+
+      function cloneMutated(brain, rate = MUTATION_STRENGTH) {
+        return brain.map((w) => w + (Math.random() * 2 - 1) * rate);
+      }
+
+      function decide(brain, inputs) {
+        const hiddenA = Math.tanh(brain[0] * inputs[0] + brain[1] * inputs[1] + brain[2] * inputs[2] + brain[3] * inputs[3] + brain[4] * inputs[4] + brain[5]);
+        const hiddenB = Math.tanh(brain[6] * inputs[0] + brain[7] * inputs[1] + brain[8] * inputs[2] + brain[9] * inputs[3] + brain[10] * inputs[4] + brain[11]);
+        const steering = Math.tanh(brain[12] * hiddenA + brain[13] * hiddenB + brain[14] * inputs[5] + brain[15]);
+        const throttle = 0.5 + 0.5 * Math.tanh(brain[16] * hiddenA + brain[17] * hiddenB + brain[18] * inputs[4] + brain[19]);
+        const brake = 0.5 + 0.5 * Math.tanh(brain[20] * inputs[3] + brain[21] * (1 - inputs[0]) + brain[22] * inputs[1] + brain[23]);
+        return { steering, throttle, brake };
+      }
+
+      class Car {
+        constructor(brain) {
+          const spawn = pointAtS(0);
+          this.x = spawn.x;
+          this.y = spawn.y;
+          this.angle = spawn.heading;
+          this.speed = 0;
+          this.brain = brain;
+          this.alive = true;
+          this.score = 0;
+          this.lastS = 0;
+          this.checkpointIndex = 0;
+          this.stuckTimer = 0;
+          this.slowTimer = 0;
+        }
+
+        update(dt) {
+          if (!this.alive) return;
+
+          const info = nearestTrackInfo(this.x, this.y);
+          const headingError = wrapAngle(this.angle - info.tangent) / Math.PI;
+          const sensors = [
+            sampleTrackDistance(this.x, this.y, this.angle - 0.8),
+            sampleTrackDistance(this.x, this.y, this.angle - 0.35),
+            sampleTrackDistance(this.x, this.y, this.angle),
+            sampleTrackDistance(this.x, this.y, this.angle + 0.35),
+            sampleTrackDistance(this.x, this.y, this.angle + 0.8),
+          ];
+
+          const action = decide(this.brain, [...sensors, headingError]);
+          const accel = action.throttle * 58 - action.brake * 40;
+
+          this.speed += accel * dt;
+          this.speed = clamp(this.speed, 6, 125);
+          this.angle += action.steering * (1.4 - this.speed * 0.006) * dt;
+
+          this.x += Math.cos(this.angle) * this.speed * dt;
+          this.y += Math.sin(this.angle) * this.speed * dt;
+
+          const current = nearestTrackInfo(this.x, this.y);
+          const delta = ((current.s - this.lastS + track.totalLength * 0.5) % track.totalLength) - track.totalLength * 0.5;
+
+          if (delta > 0.02) {
+            this.score += delta * 0.04; // базовая награда за движение вперед
+            this.stuckTimer = 0;
+          } else {
+            this.stuckTimer += dt;
+          }
+
+          this.lastS = current.s;
+
+          const nextCheckpointS = track.checkpoints[this.checkpointIndex];
+          const toCheckpoint = ((current.s - nextCheckpointS + track.totalLength) % track.totalLength);
+          if (toCheckpoint < track.totalLength / TRACK_CHECKPOINTS) {
+            this.score += 10; // награда за правильное прохождение секции
+            this.checkpointIndex = (this.checkpointIndex + 1) % TRACK_CHECKPOINTS;
+          }
+
+          if (current.distance > TRACK_RADIUS) {
+            this.alive = false;
+            return;
+          }
+
+          if (this.speed < SLOW_SPEED_LIMIT) {
+            this.slowTimer += dt;
+            if (this.slowTimer >= SLOW_TIMEOUT) {
+              this.alive = false;
+              return;
+            }
+          } else {
+            this.slowTimer = 0;
+          }
+
+          if (this.stuckTimer > 2.1) {
+            this.alive = false;
+          }
+        }
+
+        draw(isLeader = false) {
+          if (!this.alive && !isLeader) return;
+          ctx.save();
+          ctx.translate(this.x, this.y);
+          ctx.rotate(this.angle);
+          ctx.fillStyle = isLeader ? '#ffe560' : 'rgba(117,197,255,0.28)';
+          ctx.fillRect(-CAR_LENGTH / 2, -CAR_WIDTH / 2, CAR_LENGTH, CAR_WIDTH);
+          ctx.fillStyle = isLeader ? '#ff944d' : 'rgba(187,225,255,0.45)';
+          ctx.fillRect(2, -CAR_WIDTH / 2 + 1, 3, CAR_WIDTH - 2);
+          ctx.restore();
+        }
+      }
+
+      let generation = 1;
+      let stepCount = 0;
+      let bestEverScore = 0;
+      let championBrain = randomBrain();
+      let cars = [];
+
+      function spawnGeneration() {
+        cars = [];
+        for (let i = 0; i < POPULATION; i++) {
+          if (i === 0) cars.push(new Car(championBrain.slice()));
+          else cars.push(new Car(cloneMutated(championBrain)));
+        }
+        stepCount = 0;
+      }
+
+      function startNewGeneration() {
+        generateTrack(1000 + generation * 17.137 + Math.random() * 3000);
+        spawnGeneration();
+      }
+
+      function evolve() {
+        const best = cars.reduce((a, b) => (a.score > b.score ? a : b));
+        championBrain = best.brain.slice();
+        bestEverScore = Math.max(bestEverScore, best.score);
+        generation += 1;
+        startNewGeneration();
+      }
+
+      function drawTrack() {
+        ctx.fillStyle = '#101623';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+
+        ctx.beginPath();
+        ctx.strokeStyle = '#2a3247';
+        ctx.lineWidth = TRACK_RADIUS * 2 + 8;
+        for (let i = 0; i < track.centerLine.length; i++) {
+          const p = track.centerLine[i];
+          if (i === 0) ctx.moveTo(p.x, p.y);
+          else ctx.lineTo(p.x, p.y);
+        }
+        ctx.closePath();
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.strokeStyle = '#444f69';
+        ctx.lineWidth = TRACK_RADIUS * 2;
+        for (let i = 0; i < track.centerLine.length; i++) {
+          const p = track.centerLine[i];
+          if (i === 0) ctx.moveTo(p.x, p.y);
+          else ctx.lineTo(p.x, p.y);
+        }
+        ctx.closePath();
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.strokeStyle = '#cfd8ff';
+        ctx.setLineDash([12, 12]);
+        ctx.lineWidth = 2;
+        for (let i = 0; i < track.centerLine.length; i++) {
+          const p = track.centerLine[i];
+          if (i === 0) ctx.moveTo(p.x, p.y);
+          else ctx.lineTo(p.x, p.y);
+        }
+        ctx.closePath();
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        for (const s of track.checkpoints) {
+          const p = pointAtS(s);
+          ctx.fillStyle = 'rgba(255,255,255,0.12)';
+          ctx.fillRect(p.x - 1, p.y - 1, 2, 2);
+        }
+
+        const start = pointAtS(0);
+        ctx.save();
+        ctx.translate(start.x, start.y);
+        ctx.rotate(start.heading + Math.PI / 2);
+        ctx.fillStyle = '#ffffff';
+        for (let i = -3; i < 3; i++) ctx.fillRect(i * 12, -8, 8, 16);
+        ctx.restore();
+      }
+
+      let fpsClock = 0;
+      let fpsFrames = 0;
+      let fpsValue = 60;
+
+      startNewGeneration();
+      let last = performance.now();
+
+      function loop(now) {
+        const dtRaw = (now - last) / 1000;
+        last = now;
+        const dt = Math.min(1 / 25, dtRaw);
+
+        stepCount++;
+        let alive = 0;
+        for (const car of cars) {
+          car.update(dt);
+          if (car.alive) alive++;
+        }
+
+        if (alive === 0 || stepCount >= MAX_STEPS) {
+          evolve();
+          alive = POPULATION;
+        }
+
+        drawTrack();
+        const leader = cars.reduce((a, b) => (a.score > b.score ? a : b));
+        for (const car of cars) car.draw(car === leader);
+
+        hud.generation.textContent = `Поколение: ${generation}`;
+        hud.alive.textContent = `В живых: ${alive}/${POPULATION}`;
+        hud.bestScore.textContent = `Лучший счёт: ${bestEverScore.toFixed(1)}`;
+
+        fpsClock += dtRaw;
+        fpsFrames++;
+        if (fpsClock > 0.4) {
+          fpsValue = Math.round(fpsFrames / fpsClock);
+          fpsClock = 0;
+          fpsFrames = 0;
+        }
+        hud.fps.textContent = `FPS: ${fpsValue}`;
+
+        requestAnimationFrame(loop);
+      }
+
+      requestAnimationFrame(loop);
+    </script>
+  </body>
+</html>
